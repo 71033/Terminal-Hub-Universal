@@ -1026,14 +1026,27 @@ LocalPlayer.CharacterAdded:Connect(function()
     end
 end)
 
--- Единая горизонтальная прокрутка для трёх списков игроков.
--- Колесо ловится непосредственно самим маленьким ScrollingFrame,
--- поэтому основная вертикальная вкладка не двигается.
-local horizontalScrollFrames = {}
-local hoveredHorizontalFrame = nil
+-- Единая прокрутка списков игроков через компактные стрелки.
+-- Работает мышью и тапом на телефоне. Никакого hover-переключения
+-- родительского вертикального скролла здесь нет.
+local horizontalArrowFrames = {}
+local HORIZONTAL_ARROW_STEP = 120
+local HORIZONTAL_ARROW_TWEEN = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local function updateHorizontalCanvas(frame)
     if not frame or not frame.Parent then return 0 end
+
+    -- Пустой сервер: список полностью фиксирован.
+    -- Никакой Canvas overflow, стрелок или скрытого смещения быть не должно.
+    local serverEmpty = frame:FindFirstChild("ServerEmpty")
+    if serverEmpty then
+        frame.CanvasSize = UDim2.new(0, frame.AbsoluteSize.X, 0, frame.AbsoluteSize.Y)
+        if math.abs(frame.CanvasPosition.X) > 0.01 or math.abs(frame.CanvasPosition.Y) > 0.01 then
+            frame.CanvasPosition = Vector2.new(0, 0)
+        end
+        return 0
+    end
+
     local layout = frame:FindFirstChildOfClass("UIListLayout")
     if not layout then return 0 end
 
@@ -1045,90 +1058,214 @@ local function updateHorizontalCanvas(frame)
 
     local canvasWidth = math.max(contentWidth + 10, frame.AbsoluteSize.X)
     frame.CanvasSize = UDim2.new(0, canvasWidth, 0, frame.AbsoluteSize.Y)
-    return math.max(0, canvasWidth - frame.AbsoluteSize.X)
+    local maxX = math.max(0, canvasWidth - frame.AbsoluteSize.X)
+    local clampedX = math.clamp(frame.CanvasPosition.X, 0, maxX)
+    if math.abs(frame.CanvasPosition.X - clampedX) > 0.01 then
+        frame.CanvasPosition = Vector2.new(clampedX, 0)
+    elseif math.abs(frame.CanvasPosition.Y) > 0.01 then
+        frame.CanvasPosition = Vector2.new(frame.CanvasPosition.X, 0)
+    end
+    return maxX
 end
 
-local function scrollHorizontal(frame, wheel)
-    if not frame or not frame.Parent or wheel == 0 then return end
+local function updateHorizontalProgress(data)
+    if not data or not data.frame or not data.frame.Parent then return end
+
+    local frame = data.frame
+    local maxX = updateHorizontalCanvas(frame)
+    local current = math.clamp(frame.CanvasPosition.X, 0, maxX)
+    local canScroll = maxX > 1
+
+    data.left.Visible = canScroll and current > 1
+    data.right.Visible = canScroll and current < maxX - 1
+
+    if data.progressTrack and data.progressFill then
+        -- Keep the green bar visible even when there are no players / no scrollable content.
+        data.progressTrack.Visible = true
+        if canScroll then
+            local viewWidth = math.max(frame.AbsoluteSize.X, 1)
+            local contentWidth = viewWidth + maxX
+            local thumbRatio = math.clamp(viewWidth / contentWidth, 0.16, 1)
+            local trackWidth = math.max(data.progressTrack.AbsoluteSize.X, 1)
+            local thumbWidth = math.max(10, trackWidth * thumbRatio)
+            local travel = math.max(0, trackWidth - thumbWidth)
+            local progress = maxX > 0 and (current / maxX) or 0
+
+            data.progressFill.Size = UDim2.new(0, thumbWidth, 1, 0)
+            data.progressFill.Position = UDim2.new(0, travel * progress, 0, 0)
+        else
+            -- Empty/short list: leave a fixed centered green indicator.
+            data.progressFill.Size = UDim2.new(0, 28, 1, 0)
+            data.progressFill.Position = UDim2.new(0.5, -14, 0, 0)
+        end
+    end
+end
+
+local function scrollHorizontalTo(frame, targetX)
+    if not frame or not frame.Parent then return end
+
+    local maxX = updateHorizontalCanvas(frame)
+    targetX = math.clamp(targetX, 0, maxX)
+
+    local data = horizontalArrowFrames[frame]
+    if data and data.tween then
+        data.tween:Cancel()
+    end
+
+    if data then
+        data.tween = TweenService:Create(frame, HORIZONTAL_ARROW_TWEEN, {
+            CanvasPosition = Vector2.new(targetX, 0)
+        })
+        data.tween:Play()
+    else
+        frame.CanvasPosition = Vector2.new(targetX, 0)
+    end
+end
+
+local function stepHorizontal(frame, direction)
+    if not frame or not frame.Parent or direction == 0 then return end
+
     local maxX = updateHorizontalCanvas(frame)
     if maxX <= 0 then return end
 
     local current = frame.CanvasPosition.X
-    local newX = math.clamp(current - wheel * 85, 0, maxX)
-    if math.abs(newX - current) > 0.01 then
-        frame.CanvasPosition = Vector2.new(newX, 0)
-    end
+    local targetX = current + (direction * HORIZONTAL_ARROW_STEP)
+    scrollHorizontalTo(frame, targetX)
 end
 
-local function enableHorizontalWheelScroll(scrollingFrame)
-    if not scrollingFrame then return end
+local function createScrollArrow(parent, frame, text, side)
+    local button = Instance.new("TextButton")
+    button.Name = side == "left" and "ScrollLeft" or "ScrollRight"
+    button.Size = UDim2.new(0, 16, 0, 20)
+    button.AnchorPoint = side == "left" and Vector2.new(0, 0.5) or Vector2.new(1, 0.5)
+
+    local framePos = frame.Position
+    local frameSize = frame.Size
+    local centerY = framePos.Y.Offset + (frameSize.Y.Offset * 0.5)
+    button.Position = side == "left"
+        and UDim2.new(framePos.X.Scale, framePos.X.Offset + 1, framePos.Y.Scale, centerY)
+        or UDim2.new(
+            framePos.X.Scale + frameSize.X.Scale,
+            framePos.X.Offset + frameSize.X.Offset - 1,
+            framePos.Y.Scale,
+            centerY
+        )
+
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Text = text
+    button.TextColor3 = Color3.fromRGB(150, 150, 150)
+    button.TextSize = 13
+    button.Font = Enum.Font.RobotoMono
+    button.ZIndex = 20
+    button.Parent = parent
+
+    button.MouseEnter:Connect(function()
+        TweenService:Create(button, HORIZONTAL_ARROW_TWEEN, {
+            TextColor3 = Color3.fromRGB(0, 200, 100),
+            TextTransparency = 0
+        }):Play()
+    end)
+
+    button.MouseLeave:Connect(function()
+        TweenService:Create(button, HORIZONTAL_ARROW_TWEEN, {
+            TextColor3 = Color3.fromRGB(150, 150, 150)
+        }):Play()
+    end)
+
+    return button
+end
+
+local function createHorizontalProgress(parent, frame)
+    local track = Instance.new("Frame")
+    track.Name = "HorizontalScrollTrack"
+    track.Size = UDim2.new(frame.Size.X.Scale, frame.Size.X.Offset - 8, 0, 2)
+    track.Position = UDim2.new(frame.Position.X.Scale, frame.Position.X.Offset + 4,
+        frame.Position.Y.Scale, frame.Position.Y.Offset + frame.Size.Y.Offset - 2)
+    track.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    track.BorderSizePixel = 0
+    track.ZIndex = 19
+    track.Visible = false
+    track.Parent = parent
+
+    local trackCorner = Instance.new("UICorner")
+    trackCorner.CornerRadius = UDim.new(1, 0)
+    trackCorner.Parent = track
+
+    local fill = Instance.new("Frame")
+    fill.Name = "Thumb"
+    fill.Size = UDim2.new(0, 28, 1, 0)
+    fill.Position = UDim2.new(0, 0, 0, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(0, 170, 80)
+    fill.BorderSizePixel = 0
+    fill.ZIndex = 20
+    fill.Parent = track
+
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = fill
+
+    return track, fill
+end
+
+local function enableHorizontalArrowScroll(scrollingFrame)
+    if not scrollingFrame or horizontalArrowFrames[scrollingFrame] then return end
 
     scrollingFrame.Active = true
     scrollingFrame.Selectable = false
     scrollingFrame.ScrollingEnabled = false
     scrollingFrame.ScrollingDirection = Enum.ScrollingDirection.X
     scrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.None
-    scrollingFrame.ScrollBarThickness = 4
-    scrollingFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
-    scrollingFrame.ScrollBarImageTransparency = 0
+    scrollingFrame.ScrollBarThickness = 0
 
-    local data = { frame = scrollingFrame, tab = nil }
-    table.insert(horizontalScrollFrames, data)
+    local parent = scrollingFrame.Parent
+    if not parent then return end
+
+    local progressTrack, progressFill = createHorizontalProgress(parent, scrollingFrame)
+    local data = {
+        frame = scrollingFrame,
+        left = createScrollArrow(parent, scrollingFrame, "‹", "left"),
+        right = createScrollArrow(parent, scrollingFrame, "›", "right"),
+        progressTrack = progressTrack,
+        progressFill = progressFill,
+        tween = nil
+    }
+    horizontalArrowFrames[scrollingFrame] = data
+
+    data.left.ZIndex = math.max(scrollingFrame.ZIndex + 1, 20)
+    data.right.ZIndex = math.max(scrollingFrame.ZIndex + 1, 20)
+
+    data.left.MouseButton1Click:Connect(function()
+        stepHorizontal(scrollingFrame, -1)
+    end)
+
+    data.right.MouseButton1Click:Connect(function()
+        stepHorizontal(scrollingFrame, 1)
+    end)
 
     local layout = scrollingFrame:FindFirstChildOfClass("UIListLayout")
     if layout then
         layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-            updateHorizontalCanvas(scrollingFrame)
+            updateHorizontalProgress(data)
         end)
     end
+
     scrollingFrame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-        updateHorizontalCanvas(scrollingFrame)
+        updateHorizontalProgress(data)
     end)
 
-    scrollingFrame.MouseEnter:Connect(function()
-        hoveredHorizontalFrame = scrollingFrame
-        local tab = scrollingFrame:FindFirstAncestorWhichIsA("ScrollingFrame")
-        data.tab = tab
-        if tab and tab ~= scrollingFrame then
-            tab.ScrollingEnabled = false
-        end
-        updateHorizontalCanvas(scrollingFrame)
-    end)
-
-    scrollingFrame.MouseLeave:Connect(function()
-        if hoveredHorizontalFrame == scrollingFrame then
-            hoveredHorizontalFrame = nil
-        end
-        local tab = data.tab or scrollingFrame:FindFirstAncestorWhichIsA("ScrollingFrame")
-        if tab and tab ~= scrollingFrame then
-            tab.ScrollingEnabled = true
-        end
-        data.tab = nil
-    end)
-
-    -- Дополнительный прямой обработчик: колесо над самим списком.
-    scrollingFrame.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseWheel then
-            local wheel = input.Position.Z
-            if wheel == 0 then wheel = input.Delta.Z end
-            scrollHorizontal(scrollingFrame, wheel)
-        end
+    scrollingFrame:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+        updateHorizontalProgress(data)
     end)
 
     task.defer(function()
-        updateHorizontalCanvas(scrollingFrame)
+        updateHorizontalProgress(data)
     end)
 end
 
--- Fallback для Roblox-клиентов, где GuiObject.InputChanged не передаёт MouseWheel.
-UserInputService.InputChanged:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.MouseWheel then return end
-    if hoveredHorizontalFrame and hoveredHorizontalFrame.Parent then
-        local wheel = input.Position.Z
-        if wheel == 0 then wheel = input.Delta.Z end
-        scrollHorizontal(hoveredHorizontalFrame, wheel)
-    end
-end)
+-- Совместимое имя: существующие списки ниже просто получают новую систему стрелок.
+local enableHorizontalWheelScroll = enableHorizontalArrowScroll
 
 -- TP TO PLAYER: выбираешь одного игрока из списка и нажимаешь TP.
 local tpPlayerTarget = nil
@@ -1177,7 +1314,7 @@ tpPlayerListFrame.Size = UDim2.new(1, -16, 0, 42)
 tpPlayerListFrame.Position = UDim2.new(0, 8, 0, 44)
 tpPlayerListFrame.BackgroundTransparency = 1
 tpPlayerListFrame.BorderSizePixel = 0
-tpPlayerListFrame.ScrollBarThickness = 4
+tpPlayerListFrame.ScrollBarThickness = 0
 tpPlayerListFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
 tpPlayerListFrame.ScrollBarImageTransparency = 0
 tpPlayerListFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
@@ -1196,7 +1333,7 @@ local tpPlayerLayout = Instance.new("UIListLayout")
 tpPlayerLayout.FillDirection = Enum.FillDirection.Horizontal
 tpPlayerLayout.Padding = UDim.new(0, 5)
 tpPlayerLayout.Parent = tpPlayerListFrame
-enableHorizontalWheelScroll(tpPlayerListFrame)
+enableHorizontalArrowScroll(tpPlayerListFrame)
 
 local function tpPlayerSetTarget(player)
     tpPlayerTarget = player
@@ -1216,8 +1353,36 @@ end
 tpPlayerRefresh = function()
     for _, btn in pairs(tpPlayerButtons) do pcall(function() btn:Destroy() end) end
     tpPlayerButtons = {}
+    if tpPlayerListFrame then
+        tpPlayerListFrame.CanvasPosition = Vector2.new(0, 0)
+    end
     if tpPlayerTarget and (not tpPlayerTarget.Parent or tpPlayerTarget == LocalPlayer) then
         tpPlayerTarget = nil
+    end
+
+    local foundPlayer = false
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            foundPlayer = true
+            break
+        end
+    end
+
+    if not foundPlayer then
+        local emptyLabel = Instance.new("TextLabel")
+        emptyLabel.Name = "ServerEmpty"
+        emptyLabel.Size = UDim2.new(1, 0, 1, 0)
+        emptyLabel.Position = UDim2.new(0, 0, 0, 0)
+        emptyLabel.BackgroundTransparency = 1
+        emptyLabel.TextColor3 = Color3.fromRGB(135, 135, 135)
+        emptyLabel.Text = "[ SERVER EMPTY ]"
+        emptyLabel.TextSize = 15
+        emptyLabel.Font = Enum.Font.RobotoMono
+        emptyLabel.TextStrokeTransparency = 0.82
+        emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+        emptyLabel.TextYAlignment = Enum.TextYAlignment.Center
+        emptyLabel.Parent = tpPlayerListFrame
+        return
     end
 
     for _, player in ipairs(Players:GetPlayers()) do
@@ -1270,8 +1435,267 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 tpPlayerRefresh()
 
+-- FLING: полностью переработанная система.
+-- Выбирается один игрок, после чего используется классический client-side
+-- spin-fling: собственный HRP кратко получает очень высокий angular velocity,
+-- а персонаж несколько раз подводится вплотную к HRP цели. Это надёжнее,
+-- чем пытаться напрямую менять AssemblyLinearVelocity чужого персонажа.
+local flingTarget = nil
+local flingButtons = {}
+local flingListFrame = nil
+local flingBusy = false
+
+local FLING_DURATION = 1.35
+local FLING_RADIUS = 0.55
+local FLING_SPIN = 350000
+local FLING_LINEAR = 900
+
+local flingRow = Instance.new("Frame")
+flingRow.Size = UDim2.new(1, 0, 0, 90)
+flingRow.LayoutOrder = 6
+flingRow.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
+flingRow.Parent = Tabs.PLAYER
+Instance.new("UICorner", flingRow).CornerRadius = UDim.new(0, 6)
+local flingStroke = Instance.new("UIStroke", flingRow)
+flingStroke.Color = Color3.fromRGB(35, 35, 35)
+
+local flingTitle = Instance.new("TextLabel")
+flingTitle.Size = UDim2.new(1, -110, 0, 30)
+flingTitle.Position = UDim2.new(0, 15, 0, 2)
+flingTitle.BackgroundTransparency = 1
+flingTitle.TextColor3 = Color3.fromRGB(200, 200, 200)
+flingTitle.Text = "[ > ] FLING"
+flingTitle.TextSize = 13
+flingTitle.Font = Enum.Font.RobotoMono
+flingTitle.TextStrokeTransparency = 0.82
+flingTitle.TextXAlignment = Enum.TextXAlignment.Left
+flingTitle.Parent = flingRow
+
+local flingButton = Instance.new("TextButton")
+flingButton.Size = UDim2.new(0, 78, 0, 22)
+flingButton.Position = UDim2.new(1, -94, 0, 6)
+flingButton.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+flingButton.TextColor3 = Color3.fromRGB(160, 160, 160)
+flingButton.Text = "[FLING]"
+flingButton.TextSize = 12
+flingButton.Font = Enum.Font.RobotoMono
+flingButton.TextStrokeTransparency = 0.82
+flingButton.AutoButtonColor = false
+flingButton.Parent = flingRow
+Instance.new("UICorner", flingButton).CornerRadius = UDim.new(0, 4)
+local flingButtonStroke = Instance.new("UIStroke", flingButton)
+flingButtonStroke.Color = Color3.fromRGB(0, 0, 0)
+flingButtonStroke.Thickness = 1.2
+
+flingListFrame = Instance.new("ScrollingFrame")
+flingListFrame.Size = UDim2.new(1, -16, 0, 42)
+flingListFrame.Position = UDim2.new(0, 8, 0, 44)
+flingListFrame.BackgroundTransparency = 1
+flingListFrame.BorderSizePixel = 0
+flingListFrame.ScrollBarThickness = 4
+flingListFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
+flingListFrame.ScrollBarImageTransparency = 0
+flingListFrame.Active = true
+flingListFrame.ScrollingDirection = Enum.ScrollingDirection.X
+flingListFrame.AutomaticCanvasSize = Enum.AutomaticSize.X
+flingListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+flingListFrame.Parent = flingRow
+
+local flingListLayout = Instance.new("UIListLayout")
+flingListLayout.FillDirection = Enum.FillDirection.Horizontal
+flingListLayout.Padding = UDim.new(0, 5)
+flingListLayout.Parent = flingListFrame
+enableHorizontalArrowScroll(flingListFrame)
+
+local function flingSetTarget(player)
+    flingTarget = player
+    for p, btn in pairs(flingButtons) do
+        if p == player then
+            btn.Text = "[✓] " .. p.Name
+            btn.TextColor3 = Color3.fromRGB(0, 170, 80)
+            btn.BackgroundColor3 = Color3.fromRGB(18, 38, 24)
+        else
+            btn.Text = "[ ] " .. p.Name
+            btn.TextColor3 = Color3.fromRGB(180, 180, 180)
+            btn.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+        end
+    end
+end
+
+local function refreshFlingList()
+    for _, btn in pairs(flingButtons) do
+        pcall(function() btn:Destroy() end)
+    end
+    flingButtons = {}
+    if flingListFrame then
+        flingListFrame.CanvasPosition = Vector2.new(0, 0)
+    end
+
+    if flingTarget and (not flingTarget.Parent or flingTarget == LocalPlayer) then
+        flingTarget = nil
+    end
+
+    local foundPlayer = false
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            foundPlayer = true
+            break
+        end
+    end
+
+    if not foundPlayer then
+        local emptyLabel = Instance.new("TextLabel")
+        emptyLabel.Name = "ServerEmpty"
+        emptyLabel.Size = UDim2.new(1, 0, 1, 0)
+        emptyLabel.Position = UDim2.new(0, 0, 0, 0)
+        emptyLabel.BackgroundTransparency = 1
+        emptyLabel.TextColor3 = Color3.fromRGB(135, 135, 135)
+        emptyLabel.Text = "[ SERVER EMPTY ]"
+        emptyLabel.TextSize = 15
+        emptyLabel.Font = Enum.Font.RobotoMono
+        emptyLabel.TextStrokeTransparency = 0.82
+        emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+        emptyLabel.TextYAlignment = Enum.TextYAlignment.Center
+        emptyLabel.Parent = flingListFrame
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(0, math.max(104, math.min(170, #player.Name * 8 + 46)), 0, 30)
+            btn.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+            btn.TextColor3 = Color3.fromRGB(180, 180, 180)
+            btn.Text = "[ ] " .. player.Name
+            btn.TextSize = 12
+            btn.Font = Enum.Font.RobotoMono
+            btn.TextStrokeTransparency = 0.82
+            btn.AutoButtonColor = false
+            btn.Active = true
+            btn.Parent = flingListFrame
+
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+            local btnStroke = Instance.new("UIStroke", btn)
+            btnStroke.Color = Color3.fromRGB(0, 0, 0)
+            btnStroke.Thickness = 1.2
+
+            flingButtons[player] = btn
+            btn.MouseButton1Click:Connect(function()
+                flingSetTarget(player)
+            end)
+        end
+    end
+
+    if flingTarget then
+        flingSetTarget(flingTarget)
+    end
+end
+
+local function stopFlingPhysics(root, oldCFrame, oldVelocity, oldAngular)
+    if not root or not root.Parent then return end
+    pcall(function()
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.AssemblyLinearVelocity = Vector3.zero
+        if oldCFrame then root.CFrame = oldCFrame end
+        if oldVelocity then root.AssemblyLinearVelocity = oldVelocity end
+        if oldAngular then root.AssemblyAngularVelocity = oldAngular end
+    end)
+end
+
+local function performFling(player)
+    if flingBusy then return end
+    if not player or not player.Parent or player == LocalPlayer then return end
+
+    local targetChar = player.Character
+    local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not targetRoot or not targetHum or targetHum.Health <= 0 or not root then
+        return
+    end
+
+    flingBusy = true
+    flingButton.Text = "[FLING...]"
+    flingButton.TextColor3 = Color3.fromRGB(220, 180, 60)
+
+    local oldCFrame = root.CFrame
+    local oldVelocity = root.AssemblyLinearVelocity
+    local oldAngular = root.AssemblyAngularVelocity
+    local start = os.clock()
+    local angle = 0
+
+    -- Спин сохраняется на всём коротком цикле, а позиция постоянно меняется
+    -- вокруг цели. Heartbeat здесь намеренно используется вместо task.delay,
+    -- чтобы импульсы не зависели от разного FPS.
+    local connection
+    connection = RunService.Heartbeat:Connect(function(dt)
+        if not root.Parent or not targetRoot.Parent or not targetHum.Parent or targetHum.Health <= 0 then
+            connection:Disconnect()
+            stopFlingPhysics(root, oldCFrame, oldVelocity, oldAngular)
+            flingBusy = false
+            flingButton.Text = "[FLING]"
+            flingButton.TextColor3 = Color3.fromRGB(160, 160, 160)
+            return
+        end
+
+        local elapsed = os.clock() - start
+        if elapsed >= FLING_DURATION then
+            connection:Disconnect()
+            stopFlingPhysics(root, oldCFrame, oldVelocity, oldAngular)
+            flingBusy = false
+            flingButton.Text = "[FLING]"
+            flingButton.TextColor3 = Color3.fromRGB(160, 160, 160)
+            return
+        end
+
+        angle += dt * 55
+        local vertical = math.sin(angle * 2.0) * 0.35
+        local offset = Vector3.new(math.cos(angle) * FLING_RADIUS, vertical, math.sin(angle) * FLING_RADIUS)
+        local targetPosition = targetRoot.Position + offset
+        -- Keep the local character intersecting/pressing into the target from rapidly changing angles.
+        -- This makes the spin-fling much less dependent on getting a perfect single collision.
+        local inward = (targetRoot.Position - targetPosition)
+        if inward.Magnitude > 0.001 then
+            targetPosition += inward.Unit * 0.22
+        end
+        local direction = targetRoot.Position - targetPosition
+        local velocity = Vector3.zero
+        if direction.Magnitude > 0.001 then
+            velocity = direction.Unit * FLING_LINEAR
+        end
+
+        pcall(function()
+            -- Несколько раз в секунду персонаж проходит очень близко вокруг цели,
+            -- одновременно сохраняя огромную угловую скорость. Это стабильнее
+            -- для классического client-side spin-fling, чем один короткий импульс.
+            root.CFrame = CFrame.lookAt(targetPosition, targetRoot.Position)
+            root.AssemblyAngularVelocity = Vector3.new(0, FLING_SPIN, 0)
+            root.AssemblyLinearVelocity = velocity
+        end)
+    end)
+end
+
+flingButton.MouseButton1Click:Connect(function()
+    performFling(flingTarget)
+end)
+
+Players.PlayerAdded:Connect(function()
+    task.defer(refreshFlingList)
+end)
+Players.PlayerRemoving:Connect(function(player)
+    if flingTarget == player then
+        flingTarget = nil
+    end
+    task.defer(refreshFlingList)
+end)
+refreshFlingList()
+
+
+
 local noclipConnection = nil
-createToggleControl("PLAYER", "NOCLIP", 5, function(enabled)
+createToggleControl("PLAYER", "NOCLIP", 6, function(enabled)
     if enabled then
         noclipConnection = RunService.Stepped:Connect(function()
             local char = LocalPlayer.Character
@@ -1293,7 +1717,7 @@ createToggleControl("PLAYER", "NOCLIP", 5, function(enabled)
 end)
 
 local flyConn = nil
-createToggleInputControl("PLAYER", "FLY", 50, 6, function(enabled, speed)
+createToggleInputControl("PLAYER", "FLY", 50, 7, function(enabled, speed)
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -1476,7 +1900,7 @@ local function startHitboxLoop()
     end)
 end
 
-createToggleInputControl("PLAYER", "HITBOX_SIZE", 20, 7, function(enabled, value)
+createToggleInputControl("PLAYER", "HITBOX_SIZE", 20, 8, function(enabled, value)
     hitboxEnabled = enabled
     hitboxSize = math.clamp(tonumber(value) or 20, 2, 200)
 
@@ -1526,7 +1950,7 @@ local function getVectorAnchorGround(character)
     return groundPos, rootOffset
 end
 
-createVectorAnchorsControl("PLAYER", 8, 
+createVectorAnchorsControl("PLAYER", 9, 
     function(enabled)
         if not enabled then
             if redVisual then redVisual:Destroy() redVisual = nil end
@@ -1925,7 +2349,7 @@ end
 -- ON/OFF + режим DROP/THROW + текущая дистанция.
 local telekinesisRow = Instance.new("Frame")
 telekinesisRow.Size = UDim2.new(1, 0, 0, 82)
-telekinesisRow.LayoutOrder = 9
+telekinesisRow.LayoutOrder = 10
 telekinesisRow.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
 telekinesisRow.Parent = Tabs.PLAYER
 Instance.new("UICorner", telekinesisRow).CornerRadius = UDim.new(0, 6)
@@ -2137,6 +2561,9 @@ local function refreshEspExceptionButtons()
         end
     end
     espExceptionButtons = {}
+    if espExceptionPlayerList then
+        espExceptionPlayerList.CanvasPosition = Vector2.new(0, 0)
+    end
 
     local foundPlayer = false
     for _, player in ipairs(Players:GetPlayers()) do
@@ -2149,15 +2576,15 @@ local function refreshEspExceptionButtons()
     if not foundPlayer then
         local emptyLabel = Instance.new("TextLabel")
         emptyLabel.Name = "ServerEmpty"
-        emptyLabel.Size = UDim2.new(0, 210, 0, 30)
-        emptyLabel.Position = UDim2.new(0, 0, 0.5, -15)
+        emptyLabel.Size = UDim2.new(1, 0, 1, 0)
+        emptyLabel.Position = UDim2.new(0, 0, 0, 0)
         emptyLabel.BackgroundTransparency = 1
         emptyLabel.TextColor3 = Color3.fromRGB(125, 125, 125)
         emptyLabel.Text = "[ SERVER EMPTY ]"
-        emptyLabel.TextSize = 12
+        emptyLabel.TextSize = 16
         emptyLabel.Font = Enum.Font.RobotoMono
         emptyLabel.TextStrokeTransparency = 0.82
-        emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+        emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
         emptyLabel.TextYAlignment = Enum.TextYAlignment.Center
         emptyLabel.Parent = espExceptionPlayerList
         return
@@ -2235,44 +2662,28 @@ local espToggleStroke = Instance.new("UIStroke", espToggle)
 espToggleStroke.Color = Color3.fromRGB(0, 0, 0)
 espToggleStroke.Thickness = 1.2
 
-local espAll = Instance.new("TextButton")
-espAll.Size = UDim2.new(0, 58, 0, 26)
-espAll.Position = UDim2.new(0, 8, 0, 41)
-espAll.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
-espAll.TextColor3 = Color3.fromRGB(0, 170, 80)
-espAll.Text = "[ALL]"
-espAll.TextSize = 11
-espAll.Font = Enum.Font.RobotoMono
-TextStrokeTransparency = 0.82
-espAll.Parent = espRow
-Instance.new("UICorner", espAll).CornerRadius = UDim.new(0, 4)
-local espAllStroke = Instance.new("UIStroke", espAll)
-espAllStroke.Color = Color3.fromRGB(0, 0, 0)
-espAllStroke.Thickness = 1.2
-
-local espClear = espAll:Clone()
-espClear.Text = "[CLEAR]"
-espClear.TextColor3 = Color3.fromRGB(235, 70, 70)
+local espClear = Instance.new("TextButton")
+espClear.Size = UDim2.new(0, 58, 0, 24)
+espClear.Position = UDim2.new(0, 12, 0, 47)
 espClear.BackgroundColor3 = Color3.fromRGB(24, 12, 12)
-espClear.Size = UDim2.new(0, 70, 0, 26)
-espClear.Position = UDim2.new(0, 72, 0, 41)
+espClear.TextColor3 = Color3.fromRGB(235, 70, 70)
+espClear.Text = "[CLEAR]"
+espClear.TextSize = 11
+espClear.Font = Enum.Font.RobotoMono
+TextStrokeTransparency = 0.82
+espClear.AutoButtonColor = false
 espClear.Parent = espRow
-local espClearStroke = espClear:FindFirstChildOfClass("UIStroke")
-if espClearStroke then
-    espClearStroke.Color = Color3.fromRGB(90, 20, 20)
-    espClearStroke.Thickness = 1.2
-else
-    espClearStroke = Instance.new("UIStroke", espClear)
-    espClearStroke.Color = Color3.fromRGB(90, 20, 20)
-    espClearStroke.Thickness = 1.2
-end
+Instance.new("UICorner", espClear).CornerRadius = UDim.new(0, 4)
+local espClearStroke = Instance.new("UIStroke", espClear)
+espClearStroke.Color = Color3.fromRGB(90, 20, 20)
+espClearStroke.Thickness = 1.2
 
 espExceptionPlayerList = Instance.new("ScrollingFrame")
-espExceptionPlayerList.Size = UDim2.new(1, -150, 0, 42)
-espExceptionPlayerList.Position = UDim2.new(0, 148, 0, 36)
+espExceptionPlayerList.Size = UDim2.new(1, -82, 0, 42)
+espExceptionPlayerList.Position = UDim2.new(0, 78, 0, 36)
 espExceptionPlayerList.BackgroundTransparency = 1
 espExceptionPlayerList.BorderSizePixel = 0
-espExceptionPlayerList.ScrollBarThickness = 4
+espExceptionPlayerList.ScrollBarThickness = 0
 espExceptionPlayerList.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
 espExceptionPlayerList.ScrollBarImageTransparency = 0
 espExceptionPlayerList.Active = true
@@ -2287,7 +2698,7 @@ local espListLayout = Instance.new("UIListLayout")
 espListLayout.FillDirection = Enum.FillDirection.Horizontal
 espListLayout.Padding = UDim.new(0, 5)
 espListLayout.Parent = espExceptionPlayerList
-enableHorizontalWheelScroll(espExceptionPlayerList)
+enableHorizontalArrowScroll(espExceptionPlayerList)
 
 local function startESP()
     if espConnection then espConnection:Disconnect() end
@@ -2380,17 +2791,8 @@ espToggle.MouseButton1Click:Connect(function()
     end
 end)
 
-espAll.MouseButton1Click:Connect(function()
-    for player, btn in pairs(espExceptionButtons) do
-        espExceptionButtons[player] = true
-        btn.Text = "[✓] " .. player.Name
-        btn.TextColor3 = Color3.fromRGB(255, 60, 60)
-        btn.BackgroundColor3 = Color3.fromRGB(45, 18, 18)
-    end
-    syncEspExceptionNames()
-end)
-
 espClear.MouseButton1Click:Connect(function()
+    -- CLEAR: очистить выбор особых игроков
     for player, btn in pairs(espExceptionButtons) do
         espExceptionButtons[player] = false
         btn.Text = "[ ] " .. player.Name
@@ -2737,9 +3139,65 @@ local function cleanupInventoryBillboards()
 end
 
 local function updateInventoryPlayerButtons()
+    if inventoryPlayerList then
+        inventoryPlayerList.CanvasPosition = Vector2.new(0, 0)
+    end
     local alive = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then alive[player] = true end
+    end
+
+    local emptyLabel = inventoryPlayerList and inventoryPlayerList:FindFirstChild("ServerEmpty")
+    if emptyLabel then emptyLabel:Destroy() end
+
+    if inventoryPlayerList and next(alive) == nil then
+        -- Полностью тот же режим SERVER EMPTY, что и в TP / FLING / ESP:
+        -- список не прокручивается, стрелки скрыты, индикатор стоит по центру.
+        inventoryPlayerList.CanvasPosition = Vector2.new(0, 0)
+        inventoryPlayerList.ScrollingEnabled = false
+
+        local layout = inventoryPlayerList:FindFirstChildOfClass("UIListLayout")
+        if layout then
+            layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+            layout.VerticalAlignment = Enum.VerticalAlignment.Center
+        end
+
+        local label = Instance.new("TextLabel")
+        label.Name = "ServerEmpty"
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.Position = UDim2.new(0, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = Color3.fromRGB(135, 135, 135)
+        label.Text = "[ SERVER EMPTY ]"
+        label.TextSize = 16
+        label.Font = Enum.Font.RobotoMono
+        label.TextStrokeTransparency = 0.82
+        label.TextXAlignment = Enum.TextXAlignment.Center
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.LayoutOrder = -1
+        label.ZIndex = 7
+        label.Parent = inventoryPlayerList
+
+        local scrollData = horizontalArrowFrames[inventoryPlayerList]
+        if scrollData then
+            if scrollData.tween then
+                scrollData.tween:Cancel()
+                scrollData.tween = nil
+            end
+            scrollData.left.Visible = false
+            scrollData.right.Visible = false
+            if scrollData.progressTrack then scrollData.progressTrack.Visible = true end
+            if scrollData.progressFill then
+                scrollData.progressFill.Size = UDim2.new(0, 28, 1, 0)
+                scrollData.progressFill.Position = UDim2.new(0.5, -14, 0, 0)
+            end
+        end
+    elseif inventoryPlayerList then
+        local layout = inventoryPlayerList:FindFirstChildOfClass("UIListLayout")
+        if layout then
+            layout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+            layout.VerticalAlignment = Enum.VerticalAlignment.Top
+        end
     end
 
     for player, button in pairs(inventoryPlayerButtons) do
@@ -2928,7 +3386,7 @@ local function createInventoryViewerControl(tabName, order)
     playerList.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
     playerList.BackgroundTransparency = 0
     playerList.BorderSizePixel = 0
-    playerList.ScrollBarThickness = 4
+    playerList.ScrollBarThickness = 0
     playerList.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 80)
     playerList.ScrollBarImageTransparency = 0
     playerList.ScrollingDirection = Enum.ScrollingDirection.X
@@ -2956,11 +3414,17 @@ local function createInventoryViewerControl(tabName, order)
     listPadding.PaddingRight = UDim.new(0, 5)
     listPadding.PaddingTop = UDim.new(0, 4)
     listPadding.Parent = playerList
-    enableHorizontalWheelScroll(playerList)
+    enableHorizontalArrowScroll(playerList)
 
     local function updatePlayerListCanvas()
         task.defer(function()
-            playerList.CanvasSize = UDim2.new(0, math.max(list.AbsoluteContentSize.X + 10, playerList.AbsoluteSize.X), 0, playerList.AbsoluteSize.Y)
+            local width = math.max(list.AbsoluteContentSize.X + 10, playerList.AbsoluteSize.X)
+            playerList.CanvasSize = UDim2.new(0, width, 0, playerList.AbsoluteSize.Y)
+            local maxX = math.max(0, width - playerList.AbsoluteSize.X)
+            local x = math.clamp(playerList.CanvasPosition.X, 0, maxX)
+            if math.abs(playerList.CanvasPosition.X - x) > 0.01 then
+                playerList.CanvasPosition = Vector2.new(x, 0)
+            end
         end)
     end
     list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updatePlayerListCanvas)
@@ -3047,6 +3511,13 @@ local function createInventoryViewerControl(tabName, order)
         enabled = not enabled
         updateButton()
         if enabled then
+            -- По умолчанию при включении показываем инвентари всех игроков.
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer then
+                    inventorySelected[player] = true
+                end
+            end
+            updateInventoryPlayerButtons()
             elapsed = 0
             inventoryViewerConnection = RunService.Heartbeat:Connect(function(dt)
                 for player, gui in pairs(inventoryBillboards) do
@@ -3446,6 +3917,219 @@ local function createAimbotControl(tabName, name, defaultFov, order)
     end)
 
     fovBox.FocusLost:Connect(refreshFovValue)
+end
+
+-- FREECAM: камера без видимого шара; скорость движения настраивается в VISUAL.
+-- Код изолирован в do-блоке, чтобы не увеличивать число локальных регистров основного скрипта.
+do
+    local FC = {
+        active = false, camera = nil, root = nil, savedAnchored = nil,
+        savedCameraType = nil, savedSubject = nil, savedMouseBehavior = nil,
+        savedMouseIcon = nil, savedCFrame = nil, savedFov = nil,
+        position = nil, yaw = 0, pitch = 0, mouseHeld = false, speed = 42,
+        keys = {}, connections = {}, render = nil,
+    }
+
+    local function fcCleanupConnections()
+        for _, connection in ipairs(FC.connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        table.clear(FC.connections)
+        if FC.render then FC.render:Disconnect(); FC.render = nil end
+    end
+
+    local function fcStop()
+        if not FC.active then return end
+        FC.active = false
+        fcCleanupConnections()
+        UserInputService.MouseBehavior = FC.savedMouseBehavior or Enum.MouseBehavior.Default
+        if FC.savedMouseIcon ~= nil then UserInputService.MouseIconEnabled = FC.savedMouseIcon end
+        if FC.root and FC.root.Parent and FC.savedAnchored ~= nil then
+            pcall(function()
+                FC.root.AssemblyLinearVelocity = Vector3.zero
+                FC.root.AssemblyAngularVelocity = Vector3.zero
+                FC.root.Anchored = FC.savedAnchored
+            end)
+        end
+        local cam = workspace.CurrentCamera or FC.camera
+        if cam then
+            cam.CameraType = FC.savedCameraType or Enum.CameraType.Custom
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            cam.CameraSubject = humanoid or FC.savedSubject
+            if FC.savedCFrame then cam.CFrame = FC.savedCFrame end
+            if FC.savedFov then cam.FieldOfView = FC.savedFov end
+        end
+        table.clear(FC.keys)
+        FC.camera, FC.root, FC.position = nil, nil, nil
+        FC.mouseHeld = false
+    end
+
+    local function fcStart()
+        if FC.active then return end
+        local cam = workspace.CurrentCamera
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not cam or not root then
+            warn("[FREECAM] Не найден персонаж или камера.")
+            return false
+        end
+        FC.active = true
+        FC.camera, FC.root = cam, root
+        FC.savedAnchored = root.Anchored
+        FC.savedCameraType, FC.savedSubject = cam.CameraType, cam.CameraSubject
+        FC.savedCFrame, FC.savedFov = cam.CFrame, cam.FieldOfView
+        FC.savedMouseBehavior, FC.savedMouseIcon = UserInputService.MouseBehavior, UserInputService.MouseIconEnabled
+        local look = cam.CFrame.LookVector
+        FC.position = cam.CFrame.Position
+        FC.yaw = math.atan2(-look.X, -look.Z)
+        FC.pitch = math.asin(math.clamp(look.Y, -0.98, 0.98))
+        table.clear(FC.keys)
+
+
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.Anchored = true
+        cam.CameraType = Enum.CameraType.Scriptable
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+
+        table.insert(FC.connections, UserInputService.InputBegan:Connect(function(input, processed)
+            if not FC.active then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                FC.mouseHeld = true
+                UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+            elseif not processed and (input.KeyCode == Enum.KeyCode.W or input.KeyCode == Enum.KeyCode.A or input.KeyCode == Enum.KeyCode.S or input.KeyCode == Enum.KeyCode.D or input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl) then
+                FC.keys[input.KeyCode] = true
+            end
+        end))
+        table.insert(FC.connections, UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton2 then
+                FC.mouseHeld = false
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            end
+            FC.keys[input.KeyCode] = nil
+        end))
+        table.insert(FC.connections, UserInputService.InputChanged:Connect(function(input)
+            if not FC.active then return end
+            if FC.mouseHeld and input.UserInputType == Enum.UserInputType.MouseMovement then
+                FC.yaw = FC.yaw - input.Delta.X * 0.0025
+                FC.pitch = math.clamp(FC.pitch - input.Delta.Y * 0.0025, math.rad(-85), math.rad(85))
+            end
+        end))
+        FC.render = RunService.RenderStepped:Connect(function(dt)
+            if not FC.active or not FC.camera then return end
+            local rotation = CFrame.fromOrientation(FC.pitch, FC.yaw, 0)
+            local move = Vector3.zero
+            if FC.keys[Enum.KeyCode.W] then move += rotation.LookVector end
+            if FC.keys[Enum.KeyCode.S] then move -= rotation.LookVector end
+            if FC.keys[Enum.KeyCode.D] then move += rotation.RightVector end
+            if FC.keys[Enum.KeyCode.A] then move -= rotation.RightVector end
+            local frameDt = math.clamp(dt, 0, 0.05)
+            if move.Magnitude > 0 then FC.position += move.Unit * FC.speed * frameDt end
+
+            -- Вертикальная скорость постоянная и зависит от настройки FREECAM SPEED.
+            -- Ctrl — более быстрое снижение; Space — подъём; Shift — обычный спуск.
+            if FC.keys[Enum.KeyCode.LeftControl] or FC.keys[Enum.KeyCode.RightControl] then
+                FC.position += Vector3.yAxis * -(FC.speed * (24 / 42)) * frameDt
+            elseif FC.keys[Enum.KeyCode.Space] then
+                FC.position += Vector3.yAxis * (FC.speed * (20 / 42)) * frameDt
+            elseif FC.keys[Enum.KeyCode.LeftShift] or FC.keys[Enum.KeyCode.RightShift] then
+                FC.position += Vector3.yAxis * -(FC.speed * (20 / 42)) * frameDt
+            end
+
+            FC.camera.CFrame = CFrame.lookAt(FC.position, FC.position + rotation.LookVector)
+        end)
+        return true
+    end
+
+    -- Единая строка FREECAM: скорость и переключатель в одном классическом элементе.
+    local function createFreecamControl()
+        local row = Instance.new("Frame")
+        row.Name = "FreecamControl"
+        row.Size = UDim2.new(1, 0, 0, 38)
+        row.LayoutOrder = 5
+        row.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
+        row.Parent = Tabs.VISUAL
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+        local stroke = Instance.new("UIStroke", row)
+        stroke.Color = Color3.fromRGB(35, 35, 35)
+
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -190, 1, 0)
+        title.Position = UDim2.new(0, 15, 0, 0)
+        title.BackgroundTransparency = 1
+        title.TextColor3 = Color3.fromRGB(200, 200, 200)
+        title.Text = "[ > ] FREECAM / SPEED"
+        title.TextSize = 13
+        title.Font = Enum.Font.RobotoMono
+        TextStrokeTransparency = 0.82
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = row
+
+        local speedBox = Instance.new("TextBox")
+        speedBox.Name = "FreecamSpeedValue"
+        speedBox.Size = UDim2.new(0, 50, 0, 24)
+        speedBox.Position = UDim2.new(1, -155, 0.5, -12)
+        speedBox.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+        speedBox.TextColor3 = Color3.fromRGB(200, 200, 200)
+        speedBox.PlaceholderColor3 = Color3.fromRGB(90, 90, 90)
+        speedBox.Text = tostring(FC.speed)
+        speedBox.PlaceholderText = "1-200"
+        speedBox.TextSize = 13
+        speedBox.Font = Enum.Font.RobotoMono
+        TextStrokeTransparency = 0.82
+        speedBox.ClearTextOnFocus = false
+        speedBox.Parent = row
+        Instance.new("UICorner", speedBox).CornerRadius = UDim.new(0, 4)
+        local boxStroke = Instance.new("UIStroke", speedBox)
+        boxStroke.Color = Color3.fromRGB(40, 40, 40)
+
+        speedBox.FocusLost:Connect(function()
+            local value = tonumber(speedBox.Text)
+            if not value then speedBox.Text = tostring(FC.speed); return end
+            FC.speed = math.clamp(math.floor(value), 1, 200)
+            speedBox.Text = tostring(FC.speed)
+        end)
+
+        local toggleBtn = Instance.new("TextButton")
+        toggleBtn.Size = UDim2.new(0, 78, 0, 22)
+        toggleBtn.Position = UDim2.new(1, -94, 0.5, -12)
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+        toggleBtn.TextColor3 = Color3.fromRGB(180, 55, 55)
+        toggleBtn.Text = "[OFF]"
+        toggleBtn.TextSize = 12
+        toggleBtn.Font = Enum.Font.RobotoMono
+        TextStrokeTransparency = 0.82
+        toggleBtn.Parent = row
+        Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 4)
+        local tStroke = Instance.new("UIStroke", toggleBtn)
+        tStroke.Color = Color3.fromRGB(0, 0, 0)
+        local enabled = false
+        toggleBtn.MouseButton1Click:Connect(function()
+            enabled = not enabled
+            if enabled then
+                toggleBtn.Text = "[ON]"
+                TweenService:Create(row, tweenInfo, {BackgroundColor3 = Color3.fromRGB(15, 30, 20)}):Play()
+                TweenService:Create(stroke, tweenInfo, {Color = Color3.fromRGB(0, 170, 80), Thickness = 1.2}):Play()
+                TweenService:Create(toggleBtn, tweenInfo, {BackgroundColor3 = Color3.fromRGB(20, 45, 28), TextColor3 = Color3.fromRGB(0, 170, 80)}):Play()
+                TweenService:Create(tStroke, tweenInfo, {Color = Color3.fromRGB(0, 170, 80)}):Play()
+                if not fcStart() then task.defer(fcStop) end
+            else
+                toggleBtn.Text = "[OFF]"
+                TweenService:Create(row, tweenInfo, {BackgroundColor3 = Color3.fromRGB(16, 16, 16)}):Play()
+                TweenService:Create(stroke, tweenInfo, {Color = Color3.fromRGB(35, 35, 35), Thickness = 1}):Play()
+                TweenService:Create(toggleBtn, tweenInfo, {BackgroundColor3 = Color3.fromRGB(12, 12, 12), TextColor3 = Color3.fromRGB(180, 55, 55)}):Play()
+                TweenService:Create(tStroke, tweenInfo, {Color = Color3.fromRGB(0, 0, 0)}):Play()
+                fcStop()
+            end
+        end)
+    end
+    createFreecamControl()
+
+    -- В случае респавна освобождаем управление камерой.
+    table.insert(FC.connections, LocalPlayer.CharacterAdded:Connect(function()
+        if FC.active then task.defer(fcStop) end
+    end))
 end
 
 createAimbotControl("VISUAL", "AIMBOT / FOV", 180, 4)
